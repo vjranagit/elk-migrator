@@ -274,3 +274,189 @@ process_space() {
         local_names=$(echo "$local_objects" | jq -r '.[]' | sort)
         
         missing_in_cloud=$(comm -23 <(echo "$local_names") <(echo "$cloud_names"))
+        extra_in_cloud=$(comm -23 <(echo "$cloud_names") <(echo "$local_names"))
+        common_objects=$(comm -12 <(echo "$cloud_names") <(echo "$local_names"))
+        
+        # Export missing objects if requested
+        if [[ -n "$missing_in_cloud" ]]; then
+            export_missing_objects "$space_name" "$obj_type" "$missing_in_cloud" "$local_file"
+        fi
+        
+        # Add to details
+        if [[ "$first_details" == true ]]; then
+            first_details=false
+        else
+            details_obj="$details_obj,"
+        fi
+        
+        local missing_array="["
+        local extra_array="["
+        local common_array="["
+        
+        # Build arrays
+        local first_item=true
+        if [[ -n "$missing_in_cloud" ]]; then
+            while read -r name; do
+                [[ -z "$name" ]] && continue
+                if [[ "$first_item" == true ]]; then
+                    first_item=false
+                else
+                    missing_array="$missing_array,"
+                fi
+                name=$(echo "$name" | sed 's/"/\\"/g')
+                missing_array="$missing_array\"$name\""
+            done <<< "$missing_in_cloud"
+        fi
+        missing_array="$missing_array]"
+        
+        first_item=true
+        if [[ -n "$extra_in_cloud" ]]; then
+            while read -r name; do
+                [[ -z "$name" ]] && continue
+                if [[ "$first_item" == true ]]; then
+                    first_item=false
+                else
+                    extra_array="$extra_array,"
+                fi
+                name=$(echo "$name" | sed 's/"/\\"/g')
+                extra_array="$extra_array\"$name\""
+            done <<< "$extra_in_cloud"
+        fi
+        extra_array="$extra_array]"
+        
+        first_item=true
+        if [[ -n "$common_objects" ]]; then
+            while read -r name; do
+                [[ -z "$name" ]] && continue
+                if [[ "$first_item" == true ]]; then
+                    first_item=false
+                else
+                    common_array="$common_array,"
+                fi
+                name=$(echo "$name" | sed 's/"/\\"/g')
+                common_array="$common_array\"$name\""
+            done <<< "$common_objects"
+        fi
+        common_array="$common_array]"
+        
+        details_obj="$details_obj\"$obj_type\":{\"missing\":$missing_array,\"extra\":$extra_array,\"common\":$common_array}"
+        
+    done
+    
+    summary_obj="$summary_obj}"
+    details_obj="$details_obj}"
+    
+    result="{\"space\":\"$space_name\",\"status\":\"processed\",\"summary\":$summary_obj,\"details\":$details_obj}"
+    echo "$result" > "$result_file"
+}
+
+# Function to display results
+display_results() {
+    local temp_dir="/tmp/kibana_analysis_$$"
+    local total_missing=0
+    local spaces_with_issues=0
+    
+    # Summary header
+    echo -e "\n${YELLOW}=== Migration Analysis Summary ===${NC}"
+    
+    # Process all result files
+    for result_file in "$temp_dir"/*_result.json; do
+        [[ ! -f "$result_file" ]] && continue
+        
+        local space_name=$(jq -r '.space' "$result_file")
+        local status=$(jq -r '.status' "$result_file")
+        local summary=$(jq -r '.summary' "$result_file")
+        local details=$(jq -r '.details' "$result_file")
+        
+        case "$status" in
+            "no_objects")
+                if [[ "$VERBOSE" == true ]]; then
+                    echo -e "\n${BLUE}=== Space: $space_name ===${NC}"
+                    echo -e "${RED}❌ No valid objects found in either environment${NC}"
+                fi
+                continue
+                ;;
+            "no_cloud_objects")
+                echo -e "\n${BLUE}=== Space: $space_name ===${NC}"
+                echo -e "${RED}❌ No valid objects found in cloud environment${NC}"
+                echo -e "${YELLOW}⚠ Local objects exist but need migration${NC}"
+                ((spaces_with_issues++))
+                continue
+                ;;
+            "no_local_objects")
+                if [[ "$VERBOSE" == true ]]; then
+                    echo -e "\n${BLUE}=== Space: $space_name ===${NC}"
+                    echo -e "${RED}❌ No valid objects found in local environment${NC}"
+                    echo -e "${YELLOW}⚠ Cloud objects exist (may be cloud-specific)${NC}"
+                fi
+                continue
+                ;;
+        esac
+        
+        # Count total missing objects for this space AND check for differences
+        local space_missing=0
+        local space_has_differences=false
+        
+        if [[ "$summary" != "{}" ]]; then
+            # Calculate total missing
+            space_missing=$(echo "$summary" | jq -r 'to_entries[] | .value.missing' | awk '{sum += $1} END {print sum+0}')
+            
+            # Check if this space has any differences (missing objects OR extra objects)
+            local has_missing=$(echo "$summary" | jq -r 'to_entries[] | select(.value.missing > 0) | .key' | wc -l)
+            local has_extra=$(echo "$summary" | jq -r 'to_entries[] | select(.value.cloud > .value.local) | .key' | wc -l)
+            
+            if [[ $has_missing -gt 0 || $has_extra -gt 0 ]]; then
+                space_has_differences=true
+            fi
+        fi
+        
+        if [[ "$space_has_differences" == true ]]; then
+            ((spaces_with_issues++))
+        fi
+        total_missing=$((total_missing + space_missing))
+        
+        # Display space results - show if verbose OR if there are differences
+        if [[ "$VERBOSE" == true || "$space_has_differences" == true ]]; then
+            echo -e "\n${BLUE}=== Space: $space_name ===${NC}"
+            
+            if [[ "$summary" != "{}" ]]; then
+                echo -e "\n${YELLOW}Object Summary:${NC}"
+                echo "$summary" | jq -r 'to_entries[] | "\(.key) \(.value.cloud) \(.value.local) \(.value.missing)"' | while read -r obj_type cloud_count local_count missing_count; do
+                    local extra_count=$((cloud_count - local_count > 0 ? cloud_count - local_count : 0))
+                    
+                    printf "  %-20s Cloud: %3d | Local: %3d" "$obj_type" "$cloud_count" "$local_count"
+                    
+                    if [[ $missing_count -eq 0 && $extra_count -eq 0 && $cloud_count -gt 0 ]]; then
+                        echo -e " ${GREEN}✓${NC}"
+                    elif [[ $missing_count -gt 0 && $extra_count -gt 0 ]]; then
+                        echo -e " ${RED}⚠ Missing: $missing_count${NC} ${YELLOW}⚠ Extra: $extra_count${NC}"
+                    elif [[ $missing_count -gt 0 ]]; then
+                        echo -e " ${RED}⚠ Missing: $missing_count${NC}"
+                    elif [[ $extra_count -gt 0 ]]; then
+                        echo -e " ${YELLOW}⚠ Extra: $extra_count${NC}"
+                    else
+                        echo ""
+                    fi
+                done
+            fi
+            
+            # Show detailed breakdown if verbose
+            if [[ "$VERBOSE" == true && "$details" != "{}" ]]; then
+                echo "$details" | jq -r 'to_entries[] | "\(.key)|\(.value.missing)|\(.value.extra)|\(.value.common)"' | while IFS='|' read -r obj_type missing_json extra_json common_json; do
+                    missing_list=$(echo "$missing_json" | jq -r '.[]' 2>/dev/null)
+                    extra_list=$(echo "$extra_json" | jq -r '.[]' 2>/dev/null)
+                    common_list=$(echo "$common_json" | jq -r '.[]' 2>/dev/null)
+                    
+                    echo -e "\n${YELLOW}--- $obj_type Objects ---${NC}"
+                    
+                    if [[ -n "$common_list" ]]; then
+                        echo -e "${GREEN}[+] Already in cloud:${NC}"
+                        echo "$common_list" | while read -r name; do
+                            [[ -z "$name" ]] && continue
+                            echo "  ✓ $name"
+                        done
+                    fi
+                    
+                    if [[ -n "$missing_list" ]]; then
+                        echo -e "${RED}[-] Missing in cloud (needs migration):${NC}"
+                        echo "$missing_list" | while read -r name; do
