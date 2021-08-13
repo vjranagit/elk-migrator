@@ -219,3 +219,193 @@ migrate_templates() {
             echo -e "${YELLOW}Template uses time_series mode without routing_path - adjusting settings${NC}"
             
             # Option 1: Remove time_series mode
+            template_json=$(echo "$template_json" | jq 'del(.settings["index.mode"])')
+            
+            # Option 2 (alternative): Add a default routing path if you prefer to keep time series mode
+            # Use this instead of the above line if you want to preserve time series functionality
+            # template_json=$(echo "$template_json" | jq '.settings["index.routing_path"] = ["@timestamp"]')
+        fi
+        
+        # Attempt to import the template
+        response=$(cloud_request "$api_type" "PUT" "${endpoint}/$template" "$template_json" 2>&1)
+        
+        # Check if the import was successful
+        if [[ "$response" == *"\"acknowledged\":true"* ]]; then
+            echo -e "${GREEN}Successfully imported template: $template${NC}"
+        else
+            echo -e "${RED}Failed to import template: $template${NC}"
+            echo -e "${RED}$response${NC}"
+            # Log the modified JSON for debugging
+            # echo "Template JSON:"  failed
+            # echo "$template_json"  failed
+            echo "$template"  failed_templates
+        fi
+    done
+    # for template in "${missing[@]}"; do
+    #     echo -e "${BLUE}Migrating missing index template: $template${NC}"
+    #     # Extract the index_template object for this template
+    #     template_json=$(jq --arg t "$template" '.index_templates[] | select(.name==$t) | .index_template' "$local_file")
+        
+    #     # Process the template to remove component_templates if they exist
+    #     if echo "$template_json" | jq -e 'has("composed_of")' > /dev/null; then
+    #         echo -e "${YELLOW}Template uses component templates - removing references${NC}"
+    #         template_json=$(echo "$template_json" | jq 'del(.composed_of)')
+    #     fi
+        
+    #     # Attempt to import the template
+    #     response=$(cloud_request "$api_type" "PUT" "${endpoint}/$template" "$template_json" 2>&1)
+        
+    #     # Check if the import was successful
+    #     if [[ "$response" == *"\"acknowledged\":true"* ]]; then
+    #         echo -e "${GREEN}Successfully imported template: $template${NC}"
+    #     else
+    #         echo -e "${RED}Failed to import template: $template${NC}"
+    #         echo -e "${RED}$response${NC}"
+    #         # You may want to log failures for later investigation
+    #         echo "$template" failed# >> failed_templates.log
+    #     fi
+    # done
+
+    # for template in "${missing[@]}"; do
+    #     echo -e "${BLUE}Migrating missing index template: $template${NC}"
+    #     template_json=$(jq --arg t "$template" '.index_templates[] | select(.name==$t) | .index_template' "$local_file")
+    #     cloud_request "$api_type" "PUT" "${endpoint}/$template" "$template_json"
+    # done
+
+    # # Create prefixed copies of different templates
+    # for template in "${different[@]}"; do
+    #     new_template_name="migrated_${TIMESTAMP}_${template}"
+    #     echo -e "${BLUE}Creating new index template as: $new_template_name${NC}"
+    #     template_json=$(jq --arg t "$template" --arg new "$new_template_name" '.index_templates[] | select(.name==$t) | .index_template | .index_patterns = [.index_patterns[0] + "-" + $new]' "$local_file")
+    #     cloud_request "$api_type" "PUT" "${endpoint}/$new_template_name" "$template_json"
+    # done
+}
+
+# Migration function for security roles
+migrate_roles() {
+    local local_file=$1
+    local endpoint=$2
+    local api_type=$3
+    local missing=("${@:4}")
+    local different=("${@:${#missing[@]}:4}")
+    
+    # Migrate missing roles
+    for role in "${missing[@]}"; do
+        echo -e "${BLUE}Migrating missing security role: $role${NC}"
+        role_json=$(jq --arg r "$role" '.[$r]' "$local_file")
+        cloud_request "$api_type" "PUT" "${endpoint}/$role" "$role_json"
+    done
+
+    # Create prefixed copies of different roles
+    # for role in "${different[@]}"; do
+    #     new_role_name="migrated_${TIMESTAMP}_${role}"
+    #     echo -e "${BLUE}Creating new security role as: $new_role_name${NC}"
+    #     role_json=$(jq --arg r "$role" '.[$r]' "$local_file")
+    #     cloud_request "$api_type" "PUT" "${endpoint}/$new_role_name" "$role_json"
+    # done
+}
+
+# Migration function for Kibana spaces
+migrate_spaces() {
+    local local_file=$1
+    local endpoint=$2
+    local api_type=$3
+    local missing=("${@:4}")
+    local different=("${@:${#missing[@]}:4}")
+    
+    # Migrate missing spaces
+    for space in "${missing[@]}"; do
+        echo -e "${BLUE}Migrating missing Kibana space: $space${NC}"
+        space_json=$(jq --arg s "$space" '.[] | select(.id==$s)' "$local_file")
+        cloud_request "$api_type" "POST" "$endpoint" "$space_json"
+    done
+
+    # Create prefixed copies of different spaces
+    for space in "${different[@]}"; do
+        new_space_name="migrated_${TIMESTAMP}_${space}"
+        echo -e "${BLUE}Creating new Kibana space as: $new_space_name${NC}"
+        space_json=$(jq --arg s "$space" --arg new "$new_space_name" '.[] | select(.id==$s) | .id = $new | .name = $new' "$local_file")
+        cloud_request "$api_type" "POST" "$endpoint" "$space_json"
+    done
+}
+
+# Function to compare and migrate saved objects
+compare_migrate_saved_objects() {
+    local export_dir=$1
+    local saved_objects_dir="$export_dir/local_saved_objects"
+    
+    if [ ! -d "$saved_objects_dir" ]; then
+        echo -e "${RED}Error: Saved objects directory not found at $saved_objects_dir${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Analyzing Kibana saved objects...${NC}"
+    
+    # Get all export files
+    export_files=$(find "$saved_objects_dir" -name "local_kibana_space_*_export.ndjson")
+    
+    if [ -z "$export_files" ]; then
+        echo -e "${YELLOW}No saved objects export files found.${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Found $(echo "$export_files" | wc -l) saved objects export files:${NC}"
+    for file in $export_files; do
+        space=$(echo "$file" | sed 's/.*local_kibana_space_\(.*\)_export.ndjson/\1/')
+        count=$(grep -c "" "$file")
+        echo "  - Space '$space': $count objects"
+    done
+    
+    # Ask for migration confirmation
+    read -p "Do you want to import these saved objects to cloud? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Import skipped.${NC}"
+        return 0
+    fi
+    
+    # Import saved objects for each space
+    for file in $export_files; do
+        space=$(echo "$file" | sed 's/.*local_kibana_space_\(.*\)_export.ndjson/\1/')
+        
+        # Check if the space exists, create if it doesn't
+        cloud_space=$(cloud_request "kb" "GET" "api/spaces/space/$space" "" "raw")
+        if ! echo "$cloud_space" | jq -e '.id' > /dev/null 2>&1; then
+            echo -e "${YELLOW}Space '$space' doesn't exist in cloud. Creating it first...${NC}"
+            default_space_json='{"id":"'$space'","name":"'$space'","description":"Migrated from local environment"}'
+            cloud_request "kb" "POST" "api/spaces/space" "$default_space_json"
+        fi
+        
+        # Import saved objects without overwriting existing ones
+        echo -e "${BLUE}Importing saved objects to space '$space'...${NC}"
+        post_import_saved_objects "$space" "$file"
+    done
+    
+    echo -e "${GREEN}Saved objects migration completed.${NC}"
+}
+
+# Help function
+show_help() {
+    echo "Usage: $0 [options]"
+    echo
+    echo "Options:"
+    echo "  all              Run all comparisons and migrations"
+    echo "  dir <path>       Specify the export directory to use (default: latest)"
+    echo "  ilm              Compare and migrate ILM policies"
+    echo "  templates        Compare and migrate index templates"
+    echo "  roles            Compare and migrate security roles"
+    echo "  spaces           Compare and migrate Kibana spaces"
+    echo "  objects          Compare and migrate Kibana saved objects"
+    echo "  help             Show this help message"
+}
+
+# Main function to run all comparisons
+run_all_comparisons() {
+    export_dir=$1
+    
+    echo -e "${BLUE}=== Starting migration analysis ===${NC}"
+    
+    # Set up resource comparison params for each resource type
+    
+    # ILM policies
+    compare_resources "ILM policies" \
