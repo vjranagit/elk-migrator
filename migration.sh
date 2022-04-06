@@ -232,3 +232,168 @@ migrate_pipelines_as_new() {
             local_config=$(echo "$local_pipeline_content" | jq 'del(.last_modified, .username)')
             cloud_config=$(echo "$cloud_pipeline_content" | jq 'del(.last_modified, .username)')
             
+            if [ "$local_config" != "$cloud_config" ]; then
+                pipelines_different+=("$pipeline")
+            else
+                echo -e "${GREEN}Pipeline '$pipeline' is identical in both environments${NC}"
+            fi
+        else
+            # Pipeline doesn't exist in cloud
+            pipelines_missing+=("$pipeline")
+        fi
+    done
+    
+    # Report findings
+    total_to_migrate=$((${#pipelines_missing[@]} + ${#pipelines_different[@]}))
+    
+    if [ $total_to_migrate -eq 0 ]; then
+        echo -e "${GREEN}No Logstash pipelines need migration.${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Logstash pipelines migration summary:${NC}"
+    echo "  - Missing in cloud (${#pipelines_missing[@]}): ${pipelines_missing[*]}"
+    echo "  - Different from cloud (${#pipelines_different[@]}): ${pipelines_different[*]}"
+    echo
+    
+    # Show what will be created
+    echo -e "${YELLOW}Pipelines that will be created with new names:${NC}"
+    for pipeline in "${pipelines_missing[@]}"; do
+        echo "  - $pipeline (new: $pipeline)"
+    done
+    for pipeline in "${pipelines_different[@]}"; do
+        echo "  - $pipeline (new: migrated_${TIMESTAMP}_${pipeline})"
+    done
+    
+    # Ask for migration
+    read -p "Do you want to migrate these Logstash pipelines? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Migration skipped.${NC}"
+        return 0
+    fi
+    
+    # Migrate missing pipelines with original names
+    for pipeline in "${pipelines_missing[@]}"; do
+        echo -e "${BLUE}Creating missing pipeline: $pipeline${NC}"
+        
+        pipeline_json=$(jq --arg p "$pipeline" '.[$p]' "$local_pipelines_file")
+        result=$(cloud_request "es" "PUT" "_logstash/pipeline/$pipeline" "$pipeline_json" "raw")
+        
+        # IMPROVED SUCCESS DETECTION
+        # Check for various success indicators in the response
+        if echo "$result" | jq -e '.acknowledged' > /dev/null 2>&1; then
+            echo -e "${GREEN}✓ Pipeline '$pipeline' created successfully (acknowledged)${NC}"
+        elif echo "$result" | jq -e '.created' > /dev/null 2>&1; then
+            echo -e "${GREEN}✓ Pipeline '$pipeline' created successfully (created)${NC}"
+        elif echo "$result" | jq -e '.result' > /dev/null 2>&1 && [[ $(echo "$result" | jq -r '.result') == "created" ]]; then
+            echo -e "${GREEN}✓ Pipeline '$pipeline' created successfully (result: created)${NC}"
+        elif echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+            echo -e "${RED}✗ Failed to create pipeline '$pipeline': $(echo "$result" | jq -r '.errors')${NC}"
+        elif echo "$result" | jq -e '.error' > /dev/null 2>&1; then
+            echo -e "${RED}✗ Failed to create pipeline '$pipeline': $(echo "$result" | jq -r '.error.reason // .error')${NC}"
+        else
+            # If no clear error indicators, but also no success indicators, show the raw response
+            echo -e "${YELLOW}? Uncertain result for pipeline '$pipeline'. Raw response:${NC}"
+            echo "$result" | jq '.' 2>/dev/null || echo "$result"
+            
+            # Try to verify by fetching the pipeline back
+            echo -e "${BLUE}Verifying pipeline creation by fetching it back...${NC}"
+            verify_result=$(cloud_request "es" "GET" "_logstash/pipeline/$pipeline" "" "raw")
+            if echo "$verify_result" | jq -e --arg p "$pipeline" '.[$p]' > /dev/null 2>&1; then
+                echo -e "${GREEN}✓ Pipeline '$pipeline' verified - creation was successful${NC}"
+            else
+                echo -e "${RED}✗ Pipeline '$pipeline' verification failed - creation may have failed${NC}"
+            fi
+        fi
+    done
+    
+    # Migrate different pipelines with new names
+    for pipeline in "${pipelines_different[@]}"; do
+        new_pipeline_name="migrated_${TIMESTAMP}_${pipeline}"
+        echo -e "${BLUE}Creating pipeline with new name: $new_pipeline_name${NC}"
+        
+        pipeline_json=$(jq --arg p "$pipeline" '.[$p]' "$local_pipelines_file")
+        result=$(cloud_request "es" "PUT" "_logstash/pipeline/$new_pipeline_name" "$pipeline_json" "raw")
+        
+        # IMPROVED SUCCESS DETECTION (same as above)
+        if echo "$result" | jq -e '.acknowledged' > /dev/null 2>&1; then
+            echo -e "${GREEN}✓ Pipeline '$new_pipeline_name' created successfully (acknowledged)${NC}"
+        elif echo "$result" | jq -e '.created' > /dev/null 2>&1; then
+            echo -e "${GREEN}✓ Pipeline '$new_pipeline_name' created successfully (created)${NC}"
+        elif echo "$result" | jq -e '.result' > /dev/null 2>&1 && [[ $(echo "$result" | jq -r '.result') == "created" ]]; then
+            echo -e "${GREEN}✓ Pipeline '$new_pipeline_name' created successfully (result: created)${NC}"
+        elif echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+            echo -e "${RED}✗ Failed to create pipeline '$new_pipeline_name': $(echo "$result" | jq -r '.errors')${NC}"
+        elif echo "$result" | jq -e '.error' > /dev/null 2>&1; then
+            echo -e "${RED}✗ Failed to create pipeline '$new_pipeline_name': $(echo "$result" | jq -r '.error.reason // .error')${NC}"
+        else
+            # If no clear error indicators, but also no success indicators, show the raw response
+            echo -e "${YELLOW}? Uncertain result for pipeline '$new_pipeline_name'. Raw response:${NC}"
+            echo "$result" | jq '.' 2>/dev/null || echo "$result"
+            
+            # Try to verify by fetching the pipeline back
+            echo -e "${BLUE}Verifying pipeline creation by fetching it back...${NC}"
+            verify_result=$(cloud_request "es" "GET" "_logstash/pipeline/$new_pipeline_name" "" "raw")
+            if echo "$verify_result" | jq -e --arg p "$new_pipeline_name" '.[$p]' > /dev/null 2>&1; then
+                echo -e "${GREEN}✓ Pipeline '$new_pipeline_name' verified - creation was successful${NC}"
+            else
+                echo -e "${RED}✗ Pipeline '$new_pipeline_name' verification failed - creation may have failed${NC}"
+            fi
+        fi
+    done
+    
+    echo -e "${GREEN}Logstash pipeline migration completed.${NC}"
+}
+# Function to migrate index templates with new names
+migrate_templates_as_new() {
+    local export_dir=$1
+    local local_templates_file="$export_dir/es_resources/local/index_templates.json"
+    
+    if [ ! -f "$local_templates_file" ]; then
+        echo -e "${RED}Error: Index templates file not found at $local_templates_file${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Analyzing index templates...${NC}"
+    
+    # Extract template names
+    local_template_names=$(jq -r '.index_templates[].name' "$local_templates_file")
+    
+    # Prepare to migrate all templates with new names
+    templates_to_migrate=()
+    for template in $local_template_names; do
+        # Skip built-in templates
+        if [[ "$template" == ".monitoring-"* || "$template" == ".watch"* || "$template" == ".ml-"* ]]; then
+            echo -e "${YELLOW}Skipping built-in template: $template${NC}"
+            continue
+        fi
+        
+        templates_to_migrate+=("$template")
+    done
+    
+    # Report findings
+    if [ ${#templates_to_migrate[@]} -eq 0 ]; then
+        echo -e "${GREEN}No custom index templates to migrate.${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Index templates to migrate as new (${#templates_to_migrate[@]}):${NC}"
+    for template in "${templates_to_migrate[@]}"; do
+        echo "  - $template will be created as migrated_${TIMESTAMP}_${template}"
+    done
+    
+    # Ask for migration
+    read -p "Do you want to migrate these index templates to cloud with new names? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Migration skipped.${NC}"
+        return 0
+    fi
+    
+    # Migrate templates with new names
+    for template in "${templates_to_migrate[@]}"; do
+        new_template_name="migrated_${TIMESTAMP}_${template}"
+        echo -e "${BLUE}Migrating index template as: $new_template_name${NC}"
+        
+        # Get template JSON and update the name
