@@ -397,3 +397,215 @@ migrate_templates_as_new() {
         echo -e "${BLUE}Migrating index template as: $new_template_name${NC}"
         
         # Get template JSON and update the name
+        template_json=$(jq --arg t "$template" --arg nt "$new_template_name" \
+            '.index_templates[] | select(.name==$t) | .index_template' "$local_templates_file" | \
+            jq --arg nt "$new_template_name" '.index_patterns = [.index_patterns[] | sub("^"; "migrated_")] | .template.settings.index.lifecycle.name = .template.settings.index.lifecycle.name // "" | sub("^"; "migrated_'$TIMESTAMP'_")')
+        
+        cloud_request "es" "PUT" "_index_template/$new_template_name" "$template_json"
+    done
+    
+    echo -e "${GREEN}Index template migration completed.${NC}"
+}
+
+# Function to migrate security roles with new names
+migrate_roles_as_new() {
+    local export_dir=$1
+    local local_roles_file="$export_dir/es_resources/local/security_roles.json"
+    
+    if [ ! -f "$local_roles_file" ]; then
+        echo -e "${RED}Error: Security roles file not found at $local_roles_file${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Analyzing security roles...${NC}"
+    
+    # Extract role names
+    local_role_names=$(jq -r 'keys[]' "$local_roles_file")
+    
+    # Prepare to migrate all roles with new names
+    roles_to_migrate=()
+    for role in $local_role_names; do
+        # Skip built-in roles
+        if [[ "$role" == "superuser" || "$role" == "kibana_system" || "$role" == "apm_system" || 
+              "$role" == "logstash_system" || "$role" == "beats_system" || 
+              "$role" == "remote_monitoring_collector" || "$role" == "remote_monitoring_agent" ]]; then
+            echo -e "${YELLOW}Skipping built-in role: $role${NC}"
+            continue
+        fi
+        
+        roles_to_migrate+=("$role")
+    done
+    
+    # Report findings
+    if [ ${#roles_to_migrate[@]} -eq 0 ]; then
+        echo -e "${GREEN}No custom security roles to migrate.${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Security roles to migrate as new (${#roles_to_migrate[@]}):${NC}"
+    for role in "${roles_to_migrate[@]}"; do
+        echo "  - $role will be created as migrated_${TIMESTAMP}_${role}"
+    done
+    
+    # Ask for migration
+    read -p "Do you want to migrate these security roles to cloud with new names? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Migration skipped.${NC}"
+        return 0
+    fi
+    
+    # Migrate roles with new names
+    for role in "${roles_to_migrate[@]}"; do
+        new_role_name="migrated_${TIMESTAMP}_${role}"
+        echo -e "${BLUE}Migrating security role as: $new_role_name${NC}"
+        
+        # Get role JSON and update any index patterns to match the new migrated indices
+        role_json=$(jq --arg r "$role" '.[$r]' "$local_roles_file" | \
+            jq 'if .indices then .indices = [.indices[] | .names = [.names[] | sub("^"; "migrated_")]] else . end')
+        
+        cloud_request "es" "PUT" "_security/role/$new_role_name" "$role_json"
+    done
+    
+    echo -e "${GREEN}Security role migration completed.${NC}"
+}
+
+# Function to migrate spaces with new names
+migrate_spaces_as_new() {
+    local export_dir=$1
+    local local_spaces_file="$export_dir/kibana/local/kibana_spaces.json"
+    
+    if [ ! -f "$local_spaces_file" ]; then
+        echo -e "${RED}Error: Kibana spaces file not found at $local_spaces_file${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Analyzing Kibana spaces...${NC}"
+    
+    # Extract space IDs
+    local_space_ids=$(jq -r '.[].id' "$local_spaces_file")
+    
+    # Prepare to migrate all spaces with new names, except default
+    spaces_to_migrate=()
+    for space in $local_space_ids; do
+        # Skip default space
+        if [[ "$space" == "default" ]]; then
+            echo -e "${YELLOW}Skipping default space${NC}"
+            continue
+        fi
+        
+        spaces_to_migrate+=("$space")
+    done
+    
+    # Report findings
+    if [ ${#spaces_to_migrate[@]} -eq 0 ]; then
+        echo -e "${GREEN}No custom Kibana spaces to migrate.${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Kibana spaces to migrate as new (${#spaces_to_migrate[@]}):${NC}"
+    for space in "${spaces_to_migrate[@]}"; do
+        echo "  - $space will be created as migrated_${TIMESTAMP}_${space}"
+    done
+    
+    # Ask for migration
+    read -p "Do you want to migrate these Kibana spaces to cloud with new names? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Migration skipped.${NC}"
+        return 0
+    fi
+    
+    # Migrate spaces with new names
+    for space in "${spaces_to_migrate[@]}"; do
+        new_space_id="migrated_${TIMESTAMP}_${space}"
+        echo -e "${BLUE}Migrating Kibana space as: $new_space_id${NC}"
+        
+        # Get space JSON and update the ID and name
+        space_json=$(jq --arg s "$space" --arg ns "$new_space_id" \
+            '.[] | select(.id==$s) | .id = $ns | .name = "Migrated " + .name' "$local_spaces_file")
+        
+        cloud_request "kb" "POST" "api/spaces/space" "$space_json"
+    done
+    
+    echo -e "${GREEN}Kibana space migration completed.${NC}"
+}
+
+# Function to migrate saved objects with new IDs
+migrate_saved_objects_as_new() {
+    local export_dir=$1
+    local saved_objects_dir="$export_dir/local_saved_objects"
+    
+    if [ ! -d "$saved_objects_dir" ]; then
+        echo -e "${RED}Error: Saved objects directory not found at $saved_objects_dir${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Analyzing Kibana saved objects...${NC}"
+    
+    # Get all export files
+    export_files=$(find "$saved_objects_dir" -name "local_kibana_space_*_export.ndjson")
+    
+    if [ -z "$export_files" ]; then
+        echo -e "${YELLOW}No saved objects export files found.${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}Found $(echo "$export_files" | wc -l) saved objects export files:${NC}"
+    for file in $export_files; do
+        space=$(echo "$file" | sed 's/.*local_kibana_space_\(.*\)_export.ndjson/\1/')
+        count=$(grep -c "" "$file")
+        echo "  - Space '$space': $count objects"
+    done
+    
+    # Ask for migration
+    read -p "Do you want to import these saved objects to cloud with new IDs? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Import skipped.${NC}"
+        return 0
+    fi
+    
+    # Create a temp directory for transformed files
+    temp_dir=$(mktemp -d)
+    echo -e "${BLUE}Created temporary directory for transformed objects: $temp_dir${NC}"
+    
+    # Import saved objects for each space
+    for file in $export_files; do
+        space=$(echo "$file" | sed 's/.*local_kibana_space_\(.*\)_export.ndjson/\1/')
+        
+        # Determine target space
+        new_space="${space}"
+        if [[ "$space" != "default" ]]; then
+            new_space="migrated_${TIMESTAMP}_${space}"
+            
+            # Check if the space exists, create if it doesn't
+            cloud_space=$(cloud_request "kb" "GET" "api/spaces/space/$new_space" "" "raw")
+            if ! echo "$cloud_space" | jq -e '.id' > /dev/null 2>&1; then
+                echo -e "${YELLOW}Space '$new_space' doesn't exist in cloud. Creating it first...${NC}"
+                default_space_json='{"id":"'$new_space'","name":"Migrated '$space'","description":"Migrated from local environment"}'
+                cloud_request "kb" "POST" "api/spaces/space" "$default_space_json"
+            fi
+        fi
+        
+        # Transform objects
+        transformed_file="${temp_dir}/transformed_${space}.ndjson"
+        echo "" > "$transformed_file"  # Create empty file
+        
+        transform_saved_objects "$file" "$transformed_file" "migrated_${TIMESTAMP}"
+        
+        # Import transformed objects
+        post_import_saved_objects "$new_space" "$transformed_file"
+    done
+    
+    echo -e "${GREEN}Saved objects migration completed.${NC}"
+    echo -e "${BLUE}Cleaning up temporary files...${NC}"
+    rm -rf "$temp_dir"
+}
+
+# Function to migrate cluster settings as new settings (selective approach)
+migrate_cluster_settings_selective() {
+    local export_dir=$1
+    local local_settings_file="$export_dir/es_resources/local/cluster_settings.json"
+    
+    if [ ! -f "$local_settings_file" ]; then
