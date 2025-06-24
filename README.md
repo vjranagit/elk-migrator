@@ -67,6 +67,30 @@ elastic_export_YYYYMMDD_HHMMSS/
 └── cloud_saved_objects/
 ```
 
+## Compare Script
+
+A companion script to compare exported configurations between local and cloud environments.
+
+### Usage
+```bash
+./compare_script.sh
+```
+
+Automatically finds the latest export folder and compares:
+- **Elasticsearch resources:** Cluster settings, ILM policies, index templates, security roles, snapshot repositories, Logstash pipelines
+- **Kibana resources:** Spaces and saved objects per space
+
+### Output Format
+- ✅ **Green:** Resources that exist in both environments (identical/different)
+- ❌ **Red:** Resources missing in cloud (need migration)
+- ⚠️ **Yellow:** Resources only in cloud (not in local)
+
+### Features
+- Color-coded comparison results
+- Detailed diff analysis for templates and pipelines
+- Per-space saved objects comparison
+- Automatic detection of latest export folder
+
 ## Help
 ```bash
 ./script.sh help
