@@ -1,0 +1,9 @@
+profiles:
+  local:
+    es_url: http://localhost:9200
+    kibana_url: http://localhost:5601
+    api_key: LOCAL_API_KEY
+  cloud:
+    es_url: https://cloud.example.com:9200
+    kibana_url: https://cloud.example.com:5601
+    api_key: CLOUD_API_KEY

@@ -3,9 +3,10 @@
 This repository is a Bash script toolkit for exporting, comparing, and migrating configurations and saved objects between on-premise and cloud Elasticsearch/Kibana deployments.
 
 ## Codebase Overview
-- `elastic-exporter.sh`: collects configs and saved objects from source and destination clusters.
-- `compare.sh`: analyzes differences between exports to highlight what needs migration.
-- `migrationv2.sh` (and iterative versions): migrates missing resources to the cloud by creating new prefixed objects.
+- `elk-migrator.sh`: unified CLI that loads connection details from `profiles.yml` and dispatches export, compare, and migration tasks via flags.
+- `elastic-exporter.sh`: legacy exporter; functionality now available through `elk-migrator.sh -a export`.
+- `compare.sh`: legacy comparator for exports.
+- `migrationv2.sh` (and iterative versions): legacy migration helpers that created prefixed resources.
 - Utility scripts handle specialized tasks, e.g., `filter_space_objects.sh` for restricting exports or `migrate_space_objects2.sh` for saved objects per space.
 
 Exports are written to timestamped directories containing subfolders for Elasticsearch configs, Kibana settings, and per-space saved objects.
@@ -13,13 +14,13 @@ Exports are written to timestamped directories containing subfolders for Elastic
 ## Architecture and Key Concepts
 - Scripts rely on the Elasticsearch and Kibana REST APIs via `curl`.
 - `jq` processes JSON payloads.
-- Required environment variables store API keys and base URLs (`OAPI_KEY`, `CAPI_KEY`, `LOCAL_ES_URL`, `CLOUD_ES_URL`, `LOCAL_KIBANA`, `CLOUD_KIBANA`).
+- Profiles in `profiles.yml` define API keys and base URLs (`es_url`, `kibana_url`, `api_key`) for each deployment. The unified script loads the chosen profile with `-p`/`--profile`.
 - Migration is non-destructive: new resources are created with prefixed names rather than overwriting existing cloud data.
 
 ## Getting Started
-1. Install `jq` and ensure `curl` is available.
-2. Set the environment variables for local and cloud endpoints and API keys.
-3. Run `./elastic-exporter.sh` to capture data, `./compare.sh` to inspect differences, and `./migrationv2.sh` to migrate the missing pieces.
+1. Install `jq`, `yq`, and ensure `curl` is available.
+2. Copy `profiles.yml` and fill in connection details for each deployment.
+3. Run `./elk-migrator.sh -a export -p local -p cloud` to capture data, `./elk-migrator.sh -a compare -s local -d cloud` to inspect differences, and `./elk-migrator.sh -a migrate -s local -d cloud` for targeted migrations.
 
 ## Learn More
 - Explore Elasticsearch and Kibana REST APIs to understand the endpoints used by the scripts.
@@ -69,6 +70,7 @@ This layout allows `compare.sh` and related utilities to diff equivalent resourc
 ## Script Reference
 
 ### Export & Listing Utilities
+- **`elk-migrator.sh`** – Unified entry point that loads profiles and runs export, compare, and migration actions.
 - **`elastic-exporter.sh`** – Primary orchestrator that exports Elasticsearch settings, Kibana spaces, and per‑space saved objects. Includes helper subcommands for direct API calls and batch saved‑object extraction.
 - **`elastic_export.sh`** – Earlier standalone export helper used by other scripts and by `export_security.sh`.
 - **`list-local-space-objects.sh` / `list-cloud-space-objects.sh`** – Summaries of saved object types per space from the latest export.
@@ -89,7 +91,7 @@ This layout allows `compare.sh` and related utilities to diff equivalent resourc
 
 ## Architecture Notes
 
-- **Environment Variables** – Scripts rely on `LOCAL_ES_URL`, `CLOUD_ES_URL`, `LOCAL_KIBANA`, `CLOUD_KIBANA`, `OAPI_KEY`, and `CAPI_KEY`. `export_security.sh` additionally uses `stacker.yaml` and requires `yq`.
+- **Environment Variables** – Legacy scripts rely on `LOCAL_ES_URL`, `CLOUD_ES_URL`, `LOCAL_KIBANA`, `CLOUD_KIBANA`, `OAPI_KEY`, and `CAPI_KEY`. The unified CLI reads equivalent values from `profiles.yml`.
 - **Tools** – `curl` performs REST calls and `jq` (plus `yq` where applicable) manipulates JSON. Some utilities run tasks in parallel via `xargs -P` for efficiency.
 - **Non‑Destructive Strategy** – Migration scripts avoid overwriting existing cloud resources. When differences are detected, new items are created with a `migrated_<timestamp>_` prefix or similar naming scheme.
 - **Saved Object Handling** – Kibana exports are per‑space NDJSON files. Filtering and migration utilities operate on these files to limit types or chunk uploads.
